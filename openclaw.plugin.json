@@ -1,0 +1,72 @@
+{
+  "id": "taskflow",
+  "name": "Taskflow",
+  "description": "Three-layer autonomous pipeline runner: Platform (state/flow) → SubAgent (knowledge) → Coding CLI (code). Includes dashboard and notification.",
+  "version": "0.1.0",
+  "kind": "tool",
+  "skills": ["skills/taskflow"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "tasksDir": {
+        "type": "string",
+        "description": "Directory containing task folders (default: ~/clawd/tasks)"
+      },
+      "dashboardPort": {
+        "type": "integer",
+        "minimum": 1024,
+        "maximum": 65535,
+        "default": 3847,
+        "description": "Port for the Taskflow dashboard"
+      },
+      "dashboardSecret": {
+        "type": "string",
+        "description": "HMAC signing secret for dashboard auth. Token = HMAC-SHA256(secret, 'taskflow-dashboard')."
+      },
+      "issueBaseUrl": {
+        "type": "string",
+        "default": "",
+        "description": "Base URL for issue links (Gitea, GitHub, GitLab, etc.)"
+      },
+      "notify": {
+        "type": "object",
+        "description": "Fallback notification target. Auto-detected from triggering session when omitted.",
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "type": "string",
+            "description": "Notification channel (discord, telegram, etc.)"
+          },
+          "target": {
+            "type": "string",
+            "description": "Notification target (e.g. channel:123456789)"
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "tasksDir": {
+      "label": "Tasks Directory",
+      "placeholder": "~/clawd/tasks"
+    },
+    "dashboardPort": {
+      "label": "Dashboard Port",
+      "placeholder": "3847"
+    },
+    "dashboardSecret": {
+      "label": "Dashboard Secret",
+      "sensitive": true,
+      "help": "HMAC signing secret. Token is derived via HMAC-SHA256."
+    },
+    "notify.channel": {
+      "label": "Notification Channel",
+      "placeholder": "discord"
+    },
+    "notify.target": {
+      "label": "Notification Target",
+      "placeholder": "channel:123456789"
+    }
+  }
+}

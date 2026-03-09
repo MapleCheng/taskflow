@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1117">
+<link rel="manifest" href="/manifest.json">
+<title>Taskflow</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --done: #3fb950;
+    --failed: #f85149;
+    --running: #58a6ff;
+    --pending: #484f58;
+    --skipped: #8b949e;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 0;
+    min-height: 100vh;
+  }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 32px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 24px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .refresh-info {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 80px 24px;
+    color: var(--text-dim);
+  }
+
+  .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+  .empty-state p { font-size: 16px; }
+  .empty-state code {
+    background: var(--surface);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+
+  .task-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  .task-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 16px;
+  }
+
+  .task-title {
+    font-size: 18px;
+    font-weight: 600;
+  }
+
+  .task-title a {
+    color: var(--text);
+    text-decoration: none;
+  }
+  .task-title a:hover { color: var(--running); }
+
+  .task-meta {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-top: 4px;
+  }
+
+  .task-status {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .status-done { background: rgba(63,185,80,0.15); color: var(--done); }
+  .status-running { background: rgba(88,166,255,0.15); color: var(--running); }
+  .status-failed { background: rgba(248,81,73,0.15); color: var(--failed); }
+  .status-pending { background: rgba(72,79,88,0.3); color: var(--text-dim); }
+
+  .progress-bar {
+    height: 8px;
+    background: var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+
+  .progress-bar-inner {
+    height: 100%;
+    display: flex;
+    transition: width 0.5s ease;
+  }
+
+  .progress-done { background: var(--done); }
+  .progress-failed { background: var(--failed); }
+  .progress-running { background: var(--running); }
+  .progress-skipped { background: var(--skipped); }
+
+  .stats {
+    display: flex;
+    gap: 16px;
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 20px;
+  }
+
+  .stats span { display: flex; align-items: center; gap: 4px; }
+  .stats .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  .pipeline {
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+
+  .pipeline-toggle {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 4px 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .pipeline-toggle:hover { color: var(--text); }
+
+  .pipeline-content { margin-top: 12px; }
+  .pipeline-content.collapsed { display: none; }
+
+  .group {
+    margin-bottom: 16px;
+  }
+
+  .group-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .unit {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 4px;
+    margin-left: 20px;
+    background: rgba(255,255,255,0.02);
+  }
+
+  .unit:hover { background: rgba(255,255,255,0.05); }
+
+  .unit-icon { font-size: 16px; flex-shrink: 0; }
+  .unit-title { flex: 1; }
+  .unit-type {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.08);
+    color: var(--text-dim);
+  }
+  .unit-title.has-unit {
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: var(--border);
+    text-underline-offset: 3px;
+  }
+  .unit-title.has-unit:hover {
+    color: var(--running);
+    text-decoration-color: var(--running);
+  }
+
+  .unit-time {
+    color: var(--text-dim);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  body {
+    display: flex;
+    gap: 0;
+  }
+
+  #main-wrap {
+    flex: 1;
+    min-width: 0;
+    transition: flex 0.25s ease;
+    padding: 24px;
+  }
+
+  body.panel-open #main-wrap {
+    flex: 1;
+  }
+
+  .panel {
+    width: 0;
+    overflow: hidden;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    transition: width 0.25s ease;
+    flex-shrink: 0;
+  }
+  body.panel-open .panel { width: 45vw; }
+
+  /* Mobile: modal overlay instead of push panel */
+  @media (max-width: 768px) {
+    body.panel-open #main-wrap { flex: 1; }
+    .panel {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 0;
+      height: 100vh;
+      z-index: 100;
+      border-left: none;
+    }
+    body.panel-open .panel {
+      width: 100vw;
+    }
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .panel-header h2 {
+    font-size: 16px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .panel-close {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 20px;
+    cursor: pointer;
+    padding: 4px 8px;
+    flex-shrink: 0;
+  }
+  .panel-close:hover { color: var(--text); }
+
+  .panel-body {
+    padding: 20px;
+    overflow-y: auto;
+    flex: 1;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .unit-log-btn {
+    background: rgba(88,166,255,0.15);
+    color: var(--running);
+    border: none;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .unit-log-btn:hover { background: rgba(88,166,255,0.3); }
+  .unit-log-btn.is-running { animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .type-db { background: rgba(253,203,110,0.15); color: #fdcb6e; }
+  .type-backend { background: rgba(108,92,231,0.15); color: #a29bfe; }
+  .type-frontend { background: rgba(9,132,227,0.15); color: #74b9ff; }
+  .type-orval { background: rgba(225,112,85,0.15); color: #e17055; }
+  .type-config { background: rgba(0,184,148,0.15); color: #00b894; }
+</style>
+</head>
+<body>
+
+<div id="main-wrap">
+  <header>
+    <h1>🔥 Taskflow Dashboard</h1>
+    <span class="refresh-info" id="refreshInfo">auto-refresh every 5s</span>
+  </header>
+  <div id="app"></div>
+</div>
+
+<div class="panel" id="panel">
+  <div class="panel-header">
+    <h2 id="panelTitle">Unit</h2>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body" id="panelBody">Loading...</div>
+</div>
+
+<script>
+const ISSUE_BASE = '';
+
+function statusIcon(s) {
+  return { done: '✅', failed: '❌', running: '🔄', pending: '⏳', skipped: '⏭️' }[s] || '❓';
+}
+
+function statusClass(s) {
+  return `status-${s || 'pending'}`;
+}
+
+function overallStatus(stats) {
+  if (stats.failed > 0) return 'failed';
+  if (stats.running > 0) return 'running';
+  if (stats.done === stats.total && stats.total > 0) return 'done';
+  return 'pending';
+}
+
+function overallLabel(stats) {
+  if (stats.failed > 0) return 'Failed';
+  if (stats.running > 0) return 'Running';
+  if (stats.done === stats.total && stats.total > 0) return 'Done';
+  return 'Pending';
+}
+
+function formatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return d.toLocaleString('en', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function duration(start, end) {
+  if (!start) return '';
+  const ms = (end ? new Date(end) : new Date()) - new Date(start);
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function issueUrl(issue) {
+  if (!issue) return '#';
+  // "org/repo#21" → "https://github.com/org/repo/issues/21"
+  const m = issue.match(/^(.+)#(\d+)$/);
+  if (!m) return '#';
+  return `${ISSUE_BASE}/${m[1]}/issues/${m[2]}`;
+}
+
+function renderUnit(unit, taskDir) {
+  const typeClass = `unit-type type-${unit.type || 'backend'}`;
+  const time = unit.startedAt
+    ? duration(unit.startedAt, unit.completedAt)
+    : '';
+  const hasContent = !!unit.unit || unit.status === 'running' || unit.status === 'done' || unit.status === 'failed';
+  const clickAttr = hasContent
+    ? `class="unit-title has-unit" onclick="openCombined('${taskDir}','${unit.unit || ''}','${unit.id}','${(unit.title || unit.id).replace(/'/g, "\\'")}', ${unit.status === 'running'})"`
+    : `class="unit-title"`;
+  const logBtn = '';
+
+  return `
+    <div class="unit">
+      <span class="unit-icon">${statusIcon(unit.status)}</span>
+      <span ${clickAttr}>${unit.title || unit.id}</span>
+      ${logBtn}
+      <span class="${typeClass}">${unit.type || '?'}</span>
+      ${time ? `<span class="unit-time">${time}</span>` : ''}
+    </div>
+  `;
+}
+
+function renderGroup(group, taskDir) {
+  const children = group.children || [];
+  const hasChildren = children.length > 0;
+
+  let inner = '';
+  if (hasChildren) {
+    inner = children.map(c => renderUnit(c, taskDir)).join('');
+  } else {
+    inner = renderUnit(group, taskDir);
+  }
+
+  return `
+    <div class="group">
+      ${hasChildren ? `<div class="group-title">${statusIcon(group.status)} ${group.title || group.id}</div>` : ''}
+      ${inner}
+    </div>
+  `;
+}
+
+function renderTask(task) {
+  if (task._error) {
+    return `<div class="task-card"><div class="task-title">❌ ${task._dir}</div><div class="task-meta">Error: ${task._error}</div></div>`;
+  }
+
+  const stats = task._stats;
+  const status = overallStatus(stats);
+  const pct = stats.total > 0 ? Math.round((stats.done / stats.total) * 100) : 0;
+
+  const barSegments = [
+    stats.done > 0 ? `<div class="progress-done" style="width:${(stats.done/stats.total)*100}%"></div>` : '',
+    stats.failed > 0 ? `<div class="progress-failed" style="width:${(stats.failed/stats.total)*100}%"></div>` : '',
+    stats.running > 0 ? `<div class="progress-running" style="width:${(stats.running/stats.total)*100}%"></div>` : '',
+    stats.skipped > 0 ? `<div class="progress-skipped" style="width:${(stats.skipped/stats.total)*100}%"></div>` : '',
+  ].join('');
+
+  const pipeline = (task.pipeline || []).map(g => renderGroup(g, task._dir)).join('');
+
+  return `
+    <div class="task-card">
+      <div class="task-header">
+        <div>
+          <div class="task-title"><a href="${issueUrl(task.issue)}" target="_blank">${task.issue || task._dir}</a></div>
+          <div class="task-meta">
+            ${task.branch ? `branch: ${task.branch}` : ''}
+            ${task.createdAt ? ` · ${formatTime(task.createdAt)}` : ''}
+          </div>
+        </div>
+        <span class="task-status ${statusClass(status)}">${overallLabel(stats)} ${stats.done}/${stats.total} (${pct}%)</span>
+      </div>
+
+      <div class="progress-bar">
+        <div class="progress-bar-inner">${barSegments}</div>
+      </div>
+
+      <div class="stats">
+        <span><span class="dot" style="background:var(--done)"></span> Done ${stats.done}</span>
+        <span><span class="dot" style="background:var(--failed)"></span> Failed ${stats.failed}</span>
+        <span><span class="dot" style="background:var(--running)"></span> Running ${stats.running}</span>
+        <span><span class="dot" style="background:var(--pending)"></span> Pending ${stats.pending}</span>
+        ${stats.skipped > 0 ? `<span><span class="dot" style="background:var(--skipped)"></span> Skipped ${stats.skipped}</span>` : ''}
+      </div>
+
+      <div class="pipeline">
+        <button class="pipeline-toggle" onclick="togglePipeline('${task._dir}', this)">
+          ▶ Pipeline Details
+        </button>
+        <div class="pipeline-content ${expandedTasks.has(task._dir) ? '' : 'collapsed'}" data-task="${task._dir}">
+          ${pipeline}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function openPanel(title) {
+  document.getElementById('panelTitle').textContent = title;
+  document.getElementById('panelBody').innerHTML = '<div style="color:var(--text-dim)">Loading...</div>';
+  document.body.classList.add('panel-open');
+}
+
+async function openUnit(taskDir, unitFile, title) {
+  openPanel(title);
+  try {
+    const res = await fetch(`/api/unit/${encodeURIComponent(taskDir)}/${encodeURIComponent(unitFile)}`);
+    if (res.ok) {
+      document.getElementById('panelBody').textContent = await res.text();
+    } else {
+      const err = await res.json();
+      document.getElementById('panelBody').textContent = `File not found: ${err.path || unitFile}`;
+    }
+  } catch (e) {
+    document.getElementById('panelBody').textContent = `Error: ${e.message}`;
+  }
+}
+
+let logPollInterval = null;
+
+async function openCombined(taskDir, unitFile, unitId, title, isRunning) {
+  openPanel(title);
+  if (logPollInterval) clearInterval(logPollInterval);
+
+  var unitHtml = '';
+  // Load unit spec
+  if (unitFile) {
+    try {
+      var ures = await fetch('/api/unit/' + encodeURIComponent(taskDir) + '/' + encodeURIComponent(unitFile));
+      if (ures.ok) {
+        var utext = await ures.text();
+        unitHtml = '<div style="margin-bottom:20px;padding:16px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
+          '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">📄 Unit Spec</div>' +
+          '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(utext) + '</div></div>';
+      }
+    } catch(_) {}
+  }
+
+  var fetchSession = async function() {
+    try {
+      var res = await fetch('/api/session/' + encodeURIComponent(taskDir) + '/' + encodeURIComponent(unitId));
+      var sessionHtml = '';
+      if (res.ok) {
+        var data = await res.json();
+        if (data.messages && data.messages.length > 0) {
+          sessionHtml = '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">💬 Session: ' + (data.sessionId || '?') + '</div>';
+          data.messages.forEach(function(m) {
+            var roleColor = m.role === 'user' ? 'var(--running)' : 'var(--done)';
+            var roleLabel = m.role === 'user' ? '👤 User' : '🤖 Agent';
+            var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en') : '';
+            sessionHtml += '<div style="margin-bottom:16px;border-left:3px solid ' + roleColor + ';padding-left:12px">';
+            sessionHtml += '<div style="font-size:11px;color:' + roleColor + ';margin-bottom:4px">' + roleLabel + ' ' + time + '</div>';
+            sessionHtml += '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div>';
+            sessionHtml += '</div>';
+          });
+        }
+      }
+      var body = document.getElementById('panelBody');
+      var isAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 50;
+      body.innerHTML = unitHtml + sessionHtml || unitHtml + '<div style="color:var(--text-dim)">(no session yet)</div>';
+      if (isAtBottom) body.scrollTop = body.scrollHeight;
+    } catch(e) {
+      document.getElementById('panelBody').innerHTML = unitHtml + '<div style="color:var(--text-dim)">Session error: ' + e.message + '</div>';
+    }
+  };
+
+  await fetchSession();
+  if (isRunning) {
+    logPollInterval = setInterval(fetchSession, 2000);
+  }
+}
+
+async function openSession(taskDir, unitId, title, isRunning) {
+  openPanel('💬 ' + title);
+  if (logPollInterval) clearInterval(logPollInterval);
+
+  var fetchSession = async function() {
+    try {
+      var res = await fetch('/api/session/' + encodeURIComponent(taskDir) + '/' + encodeURIComponent(unitId));
+      if (!res.ok) {
+        document.getElementById('panelBody').innerHTML = '<div style="color:var(--text-dim)">(no session found — this unit may have run in direct mode)</div>';
+        return;
+      }
+      var data = await res.json();
+      if (data.error) {
+        document.getElementById('panelBody').textContent = 'Error: ' + data.error;
+        return;
+      }
+      var html = '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Session: ' + (data.sessionId || '?') + '</div>';
+      (data.messages || []).forEach(function(m) {
+        var roleColor = m.role === 'user' ? 'var(--running)' : 'var(--done)';
+        var roleLabel = m.role === 'user' ? '👤 User' : '🤖 Agent';
+        var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en') : '';
+        html += '<div style="margin-bottom:16px;border-left:3px solid ' + roleColor + ';padding-left:12px">';
+        html += '<div style="font-size:11px;color:' + roleColor + ';margin-bottom:4px">' + roleLabel + ' ' + time + '</div>';
+        html += '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div>';
+        html += '</div>';
+      });
+      var body = document.getElementById('panelBody');
+      body.innerHTML = html;
+      body.scrollTop = body.scrollHeight;
+    } catch(e) {
+      document.getElementById('panelBody').textContent = 'Error: ' + e.message;
+    }
+  };
+
+  await fetchSession();
+  if (isRunning) {
+    logPollInterval = setInterval(fetchSession, 2000);
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function closePanel() {
+  document.body.classList.remove('panel-open');
+  if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closePanel();
+});
+
+const expandedTasks = new Set();
+
+function togglePipeline(dir, btn) {
+  if (expandedTasks.has(dir)) {
+    expandedTasks.delete(dir);
+  } else {
+    expandedTasks.add(dir);
+  }
+  const content = btn.nextElementSibling;
+  content.classList.toggle('collapsed');
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/tasks');
+    const tasks = await res.json();
+
+    if (tasks.length === 0) {
+      document.getElementById('app').innerHTML = `
+        <div class="empty-state">
+          <div class="icon">📋</div>
+          <p>No pipelines yet</p>
+          <p style="margin-top:8px">Run <code>taskflow_run</code> to start the pipeline</p>
+        </div>
+      `;
+    } else {
+      document.getElementById('app').innerHTML = tasks.map(renderTask).join('');
+    }
+
+    document.getElementById('refreshInfo').textContent =
+      `Last updated: ${new Date().toLocaleTimeString('en')} · auto-refresh every 5s`;
+  } catch (e) {
+    document.getElementById('refreshInfo').textContent = `Refresh failed: ${e.message}`;
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+
+// Register service worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+
+</body>
+</html>
