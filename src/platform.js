@@ -7,7 +7,6 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { execSync } from 'node:child_process';
 
 // ── Manifest helpers ──
 
@@ -90,109 +89,205 @@ export function countStats(nodes) {
   return { total, done, failed, running, blocked };
 }
 
-// ── Execution ──
+// ── Validation ──
 
-function executeDirect(unitContent, manifest, tasksDir, taskDir, unitId) {
-  let command = '';
-  const match = unitContent.match(/```(?:bash|sh)\n([\s\S]*?)```/);
-  if (match) command = match[1].trim();
+const VALID_STATUSES = new Set(['pending', 'running', 'done', 'failed', 'skipped', 'blocked']);
 
-  if (!command) {
-    return { status: 'failed', error: 'No executable command found in unit file' };
+/**
+ * Validate manifest against the v2 schema.
+ * Throws on fatal errors, returns warnings for non-fatal issues.
+ * Backward compatible: old manifests with 'issue'/'repoPath' still pass.
+ */
+export function validateManifest(manifest) {
+  const errors = [];
+  const warnings = [];
+
+  // pipeline is the minimum requirement
+  if (!manifest.pipeline || !Array.isArray(manifest.pipeline) || manifest.pipeline.length === 0) {
+    errors.push('pipeline is required and must be a non-empty array');
   }
 
-  const cwd = manifest.repoPath || process.cwd();
-  if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
-
-  writeLog(tasksDir, taskDir, unitId, `$ ${command}\n\n`, false);
-
-  try {
-    const output = execSync(command, {
-      cwd,
-      encoding: 'utf-8',
-      timeout: 60000,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    writeLog(tasksDir, taskDir, unitId, output + `\n[exit code: 0]\n`);
-    return { status: 'done', summary: output.trim().slice(-200) || 'OK' };
-  } catch (e) {
-    const stderr = (e.stderr || '').toString();
-    const stdout = (e.stdout || '').toString();
-    writeLog(tasksDir, taskDir, unitId, stdout + `\n[stderr] ${stderr}\n[exit code: ${e.status}]\n`);
-    return {
-      status: 'failed',
-      error: (stderr || stdout || e.message).trim().slice(-500)
-    };
+  if (!manifest.title) {
+    errors.push('title is required');
   }
+  if (!manifest.id) {
+    errors.push('id is required');
+  }
+  if (!manifest.session) {
+    errors.push('session is required');
+  }
+
+  // Validate issues array if present
+  const issueUrls = new Set();
+  if (manifest.issues && Array.isArray(manifest.issues)) {
+    for (const issue of manifest.issues) {
+      if (!issue.url) errors.push('each issue must have a url');
+      if (!issue.repo) errors.push(`issue ${issue.url || '?'} must have a repo`);
+      if (issue.number == null) errors.push(`issue ${issue.url || '?'} must have a number`);
+      if (!issue.path) errors.push(`issue ${issue.url || '?'} must have a path`);
+      if (issue.url) issueUrls.add(issue.url);
+    }
+  }
+
+  // Validate pipeline items
+  if (manifest.pipeline && Array.isArray(manifest.pipeline)) {
+    const ids = new Set();
+
+    function validateItem(item, path) {
+      // Required fields
+      if (!item.id) errors.push(`${path}: missing id`);
+      if (!item.title) errors.push(`${path}: missing title`);
+
+      // Unique id
+      if (item.id) {
+        if (ids.has(item.id)) errors.push(`${path}: duplicate id '${item.id}'`);
+        ids.add(item.id);
+      }
+
+      // Mutual exclusivity: unit vs children
+      if (item.unit && item.children) {
+        errors.push(`${path}: 'unit' and 'children' are mutually exclusive`);
+      }
+      if (!item.unit && !item.children) {
+        errors.push(`${path}: must have either 'unit' or 'children'`);
+      }
+
+      // Status whitelist
+      if (item.status && !VALID_STATUSES.has(item.status)) {
+        errors.push(`${path}: invalid status '${item.status}'`);
+      }
+
+      // Issue reference validation
+      if (item.issue && issueUrls.size > 0 && !issueUrls.has(item.issue)) {
+        errors.push(`${path}: issue '${item.issue}' not found in manifest.issues`);
+      }
+      if (item.issue && (!manifest.issues || manifest.issues.length === 0)) {
+        errors.push(`${path}: has issue ref but manifest.issues is empty`);
+      }
+
+      // Recurse into children
+      if (item.children && Array.isArray(item.children)) {
+        for (let i = 0; i < item.children.length; i++) {
+          validateItem(item.children[i], `${path}.children[${i}]`);
+        }
+      }
+    }
+
+    for (let i = 0; i < manifest.pipeline.length; i++) {
+      // Top-level items must be groups (have children)
+      if (!manifest.pipeline[i].children || manifest.pipeline[i].children.length === 0) {
+        errors.push(`pipeline[${i}]: top-level items must be groups (must have children)`);
+      }
+      validateItem(manifest.pipeline[i], `pipeline[${i}]`);
+    }
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
 }
 
-function executeViaAgent(tasksDir, taskDir, unit, unitContent, manifest) {
-  const sessionId = `taskflow-${taskDir}-${unit.id}`;
-  const prompt = [
+// ── Working directory resolution ──
+
+/**
+ * Resolve working directory for a unit.
+ * Priority: unit.issue → issues[].path > manifest.repoPath > cwd
+ */
+export function getUnitWorkDir(unit, manifest) {
+  if (unit.issue && manifest.issues && Array.isArray(manifest.issues)) {
+    const match = manifest.issues.find(i => i.url === unit.issue);
+    if (match && match.path) return match.path;
+  }
+  // Fallback: first issue's path, then cwd
+  if (manifest.issues && manifest.issues.length > 0 && manifest.issues[0].path) {
+    return manifest.issues[0].path;
+  }
+  return process.cwd();
+}
+
+// ── Execution ──
+
+/**
+ * Build the agent prompt for a unit.
+ */
+export function buildUnitPrompt(unit, unitContent, manifest) {
+  return [
     `You are executing a taskflow unit. Follow the instructions exactly.`,
     `After completing the task, your LAST line of output must be a JSON status:`,
     `{"status":"done","summary":"what you did"} or {"status":"failed","error":"what went wrong"}`,
     ``,
-    `Working directory: ${manifest.repoPath || '/tmp'}`,
+    `Working directory: ${getUnitWorkDir(unit, manifest)}`,
     ``,
-    `--- UNIT SPEC ---`,
+    `--- UNIT PROMPT ---`,
     unitContent,
     `--- END UNIT ---`,
   ].join('\n');
-
-  writeLog(tasksDir, taskDir, unit.id, `[Agent Session: ${sessionId}]\n[Prompt sent, waiting for response...]\n\n`, false);
-
-  try {
-    const output = execSync(
-      `openclaw agent --session-id "${sessionId}" --message ${JSON.stringify(prompt)}`,
-      {
-        encoding: 'utf-8',
-        timeout: 300000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, HOME: process.env.HOME }
-      }
-    );
-
-    const lines = output.trim().split('\n');
-    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
-      try {
-        const parsed = JSON.parse(lines[i].trim());
-        if (parsed.status) return parsed;
-      } catch (_) {}
-    }
-
-    writeLog(tasksDir, taskDir, unit.id, output);
-    return { status: 'done', summary: output.trim().slice(-300), sessionId };
-  } catch (e) {
-    return {
-      status: 'failed',
-      error: (e.stderr || e.message || '').trim().slice(-500),
-      sessionId
-    };
-  }
 }
 
-export async function executeUnit(tasksDir, taskDir, unit, manifest, mode = 'direct') {
+/**
+ * Build the session key for a unit.
+ */
+export function buildUnitSessionKey(taskDir, unitId) {
+  return `taskflow-${taskDir}-${unitId}`;
+}
+
+/**
+ * Execute a unit using the provided executor.
+ * @param {object} opts
+ * @param {function} opts.executor - async (sessionKey, prompt) => { status, summary?, error? }
+ */
+export async function executeUnit(tasksDir, taskDir, unit, manifest, { executor }) {
   const unitContent = readUnit(tasksDir, taskDir, unit.unit);
   if (!unitContent) {
     return { status: 'failed', error: 'Unit file not found: ' + unit.unit };
   }
 
-  if (mode === 'agent') {
-    return executeViaAgent(tasksDir, taskDir, unit, unitContent, manifest);
-  } else {
-    return executeDirect(unitContent, manifest, tasksDir, taskDir, unit.id);
+  const sessionKey = buildUnitSessionKey(taskDir, unit.id);
+  const prompt = buildUnitPrompt(unit, unitContent, manifest);
+
+  writeLog(tasksDir, taskDir, unit.id, `[Session: ${sessionKey}]\n[Prompt sent, waiting for response...]\n\n`, false);
+
+  try {
+    const result = await executor(sessionKey, prompt);
+    writeLog(tasksDir, taskDir, unit.id, `[Result: ${JSON.stringify(result)}]\n`);
+    return result;
+  } catch (e) {
+    const error = (e.message || String(e)).slice(-500);
+    writeLog(tasksDir, taskDir, unit.id, `[Error: ${error}]\n`);
+    return { status: 'failed', error, sessionKey };
   }
 }
 
 // ── Main loop ──
 
-export async function runPipeline(tasksDir, taskDir, mode = 'direct', { onNotify, logger } = {}) {
+/**
+ * Run a pipeline.
+ * @param {string} tasksDir
+ * @param {string} taskDir
+ * @param {object} opts
+ * @param {function} opts.executor - async (sessionKey, prompt) => { status, summary?, error? }
+ * @param {function} [opts.onNotify] - (message, manifest) => void
+ * @param {object} [opts.logger]
+ */
+export async function runPipeline(tasksDir, taskDir, { executor, onNotify, logger } = {}) {
+  if (!executor) throw new Error('executor is required');
   const log = logger || console;
   log.info(`🔥 Taskflow Platform starting: ${taskDir}`);
 
   const manifest = readManifest(tasksDir, taskDir);
   manifest._taskDir = taskDir;
+
+  // Validate manifest before running
+  const validation = validateManifest(manifest);
+  if (!validation.valid) {
+    log.info(`❌ Manifest validation failed:\n  ${validation.errors.join('\n  ')}`);
+    manifest.status = 'failed';
+    writeManifest(tasksDir, taskDir, manifest);
+    if (onNotify) onNotify(`❌ Manifest validation failed: ${validation.errors[0]}`, manifest);
+    return;
+  }
+  if (validation.warnings.length > 0) {
+    log.info(`⚠️ Manifest warnings:\n  ${validation.warnings.join('\n  ')}`);
+  }
+
   manifest.status = 'running';
   manifest.startedAt = manifest.startedAt || new Date().toISOString();
   writeManifest(tasksDir, taskDir, manifest);
@@ -230,7 +325,7 @@ export async function runPipeline(tasksDir, taskDir, mode = 'direct', { onNotify
     const stats = countStats(manifest.pipeline);
     log.info(`[${stats.done + 1}/${stats.total}] Running: ${unit.title} (${unit.type || 'task'})`);
 
-    const result = await executeUnit(tasksDir, taskDir, unit, manifest, mode);
+    const result = await executeUnit(tasksDir, taskDir, unit, manifest, { executor });
 
     unit.status = result.status;
     unit.completedAt = new Date().toISOString();

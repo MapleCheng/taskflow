@@ -310,6 +310,51 @@
     word-break: break-word;
   }
 
+  /* Collapsible messages */
+  .msg-wrap {
+    position: relative;
+    max-height: 150px;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+  }
+  .msg-wrap.expanded {
+    max-height: none;
+  }
+  .msg-collapsible {
+    position: relative;
+  }
+  .msg-collapsible:not(.expanded) .msg-wrap {
+    max-height: 150px;
+    overflow: hidden;
+  }
+  .msg-collapsible.expanded .msg-wrap {
+    max-height: none;
+  }
+  .msg-fade {
+    position: relative;
+    height: 48px;
+    margin-top: -48px;
+    background: linear-gradient(transparent, var(--surface));
+    text-align: center;
+    line-height: 64px;
+  }
+  .msg-collapsible.expanded .msg-fade {
+    height: auto;
+    margin-top: 4px;
+    background: none;
+    line-height: normal;
+  }
+  .msg-toggle {
+    font-size: 11px;
+    color: var(--running);
+    cursor: pointer;
+    user-select: none;
+    background: rgba(88,166,255,0.1);
+    padding: 2px 10px;
+    border-radius: 10px;
+  }
+  .msg-toggle:hover { background: rgba(88,166,255,0.2); }
+
   .unit-log-btn {
     background: rgba(88,166,255,0.15);
     color: var(--running);
@@ -353,7 +398,7 @@
 </div>
 
 <script>
-const ISSUE_BASE = '';
+
 
 function statusIcon(s) {
   return { done: '✅', failed: '❌', running: '🔄', pending: '⏳', skipped: '⏭️' }[s] || '❓';
@@ -380,7 +425,12 @@ function overallLabel(stats) {
 function formatTime(ts) {
   if (!ts) return '';
   const d = new Date(ts);
-  return d.toLocaleString('en', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const Y = d.getFullYear();
+  const M = String(d.getMonth() + 1).padStart(2, '0');
+  const D = String(d.getDate()).padStart(2, '0');
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  return `${Y}-${M}-${D} ${h}:${m}`;
 }
 
 function duration(start, end) {
@@ -394,15 +444,21 @@ function duration(start, end) {
   return `${h}h ${m % 60}m`;
 }
 
-function issueUrl(issue) {
-  if (!issue) return '#';
-  // "org/repo#21" → "https://github.com/org/repo/issues/21"
-  const m = issue.match(/^(.+)#(\d+)$/);
-  if (!m) return '#';
-  return `${ISSUE_BASE}/${m[1]}/issues/${m[2]}`;
-}
+function renderUnit(unit, taskDir, depth = 0) {
+  // If unit has children, render as a sub-group
+  if (unit.children && unit.children.length > 0) {
+    const inner = unit.children.map(c => renderUnit(c, taskDir, depth + 1)).join('');
+    return `
+      <div class="unit-group" style="margin-left:${depth * 16}px">
+        <div class="unit" style="font-weight:600">
+          <span class="unit-icon">${statusIcon(unit.status)}</span>
+          <span class="unit-title">${unit.title || unit.id}</span>
+        </div>
+        ${inner}
+      </div>
+    `;
+  }
 
-function renderUnit(unit, taskDir) {
   const typeClass = `unit-type type-${unit.type || 'backend'}`;
   const time = unit.startedAt
     ? duration(unit.startedAt, unit.completedAt)
@@ -411,13 +467,12 @@ function renderUnit(unit, taskDir) {
   const clickAttr = hasContent
     ? `class="unit-title has-unit" onclick="openCombined('${taskDir}','${unit.unit || ''}','${unit.id}','${(unit.title || unit.id).replace(/'/g, "\\'")}', ${unit.status === 'running'})"`
     : `class="unit-title"`;
-  const logBtn = '';
 
   return `
-    <div class="unit">
+    <div class="unit" style="${depth > 0 ? `margin-left:${depth * 16}px` : ''}">
       <span class="unit-icon">${statusIcon(unit.status)}</span>
+      <code style="font-size:11px;color:var(--text-dim);margin-right:6px;user-select:all">${unit.id}</code>
       <span ${clickAttr}>${unit.title || unit.id}</span>
-      ${logBtn}
       <span class="${typeClass}">${unit.type || '?'}</span>
       ${time ? `<span class="unit-time">${time}</span>` : ''}
     </div>
@@ -463,18 +518,16 @@ function renderTask(task) {
 
   return `
     <div class="task-card">
-      <div class="task-header">
-        <div>
-          <div class="task-title"><a href="${issueUrl(task.issue)}" target="_blank">${task.issue || task._dir}</a></div>
-          <div class="task-meta">
-            ${task.branch ? `branch: ${task.branch}` : ''}
-            ${task.createdAt ? ` · ${formatTime(task.createdAt)}` : ''}
-          </div>
-        </div>
+      <div class="task-header" style="align-items:flex-end;margin-bottom:4px">
+        <code style="font-size:13px;color:var(--text-dim);user-select:all">${task.id || task._dir}</code>
         <span class="task-status ${statusClass(status)}">${overallLabel(stats)} ${stats.done}/${stats.total} (${pct}%)</span>
       </div>
+      <div class="task-title" style="user-select:all">${task.title || ''}</div>
+      <div class="task-meta">
+        ${task.createdAt ? formatTime(task.createdAt) : ''}${task.issues?.length ? ' · ' + task.issues.map(i => `<a href="${i.url}" target="_blank" style="color:var(--running);text-decoration:none">${i.repo}#${i.number}</a>`).join(' · ') : ''}
+      </div>
 
-      <div class="progress-bar">
+      <div class="progress-bar" style="margin-top:16px">
         <div class="progress-bar-inner">${barSegments}</div>
       </div>
 
@@ -533,7 +586,7 @@ async function openCombined(taskDir, unitFile, unitId, title, isRunning) {
       if (ures.ok) {
         var utext = await ures.text();
         unitHtml = '<div style="margin-bottom:20px;padding:16px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
-          '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">📄 Unit Spec</div>' +
+          '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">📄 Unit Prompt</div>' +
           '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(utext) + '</div></div>';
       }
     } catch(_) {}
@@ -547,21 +600,24 @@ async function openCombined(taskDir, unitFile, unitId, title, isRunning) {
         var data = await res.json();
         if (data.messages && data.messages.length > 0) {
           sessionHtml = '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">💬 Session: ' + (data.sessionId || '?') + '</div>';
-          data.messages.forEach(function(m) {
+          data.messages.forEach(function(m, idx) {
             var roleColor = m.role === 'user' ? 'var(--running)' : 'var(--done)';
             var roleLabel = m.role === 'user' ? '👤 User' : '🤖 Agent';
             var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en') : '';
+            var msgId = 'msg-' + taskDir + '-' + unitId + '-' + idx;
             sessionHtml += '<div style="margin-bottom:16px;border-left:3px solid ' + roleColor + ';padding-left:12px">';
             sessionHtml += '<div style="font-size:11px;color:' + roleColor + ';margin-bottom:4px">' + roleLabel + ' ' + time + '</div>';
-            sessionHtml += '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div>';
-            sessionHtml += '</div>';
+            sessionHtml += '<div class="msg-collapsible" id="' + msgId + '">';
+            sessionHtml += '<div class="msg-wrap"><div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div></div>';
+            sessionHtml += '<div class="msg-fade"><span class="msg-toggle" onclick="toggleMsg(this)">▼ Show more</span></div>';
+            sessionHtml += '</div></div>';
           });
         }
       }
       var body = document.getElementById('panelBody');
       var isAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 50;
       body.innerHTML = unitHtml + sessionHtml || unitHtml + '<div style="color:var(--text-dim)">(no session yet)</div>';
-      if (isAtBottom) body.scrollTop = body.scrollHeight;
+      if (isAtBottom) _scrollAfterInit = true;
     } catch(e) {
       document.getElementById('panelBody').innerHTML = unitHtml + '<div style="color:var(--text-dim)">Session error: ' + e.message + '</div>';
     }
@@ -590,18 +646,21 @@ async function openSession(taskDir, unitId, title, isRunning) {
         return;
       }
       var html = '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Session: ' + (data.sessionId || '?') + '</div>';
-      (data.messages || []).forEach(function(m) {
+      (data.messages || []).forEach(function(m, idx) {
         var roleColor = m.role === 'user' ? 'var(--running)' : 'var(--done)';
         var roleLabel = m.role === 'user' ? '👤 User' : '🤖 Agent';
         var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en') : '';
+        var msgId = 'smsg-' + taskDir + '-' + unitId + '-' + idx;
         html += '<div style="margin-bottom:16px;border-left:3px solid ' + roleColor + ';padding-left:12px">';
         html += '<div style="font-size:11px;color:' + roleColor + ';margin-bottom:4px">' + roleLabel + ' ' + time + '</div>';
-        html += '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div>';
-        html += '</div>';
+        html += '<div class="msg-collapsible" id="' + msgId + '">';
+        html += '<div class="msg-wrap"><div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + escapeHtml(m.text || '') + '</div></div>';
+        html += '<div class="msg-fade"><span class="msg-toggle" onclick="toggleMsg(this)">▼ Show more</span></div>';
+        html += '</div></div>';
       });
       var body = document.getElementById('panelBody');
       body.innerHTML = html;
-      body.scrollTop = body.scrollHeight;
+      _scrollAfterInit = true;
     } catch(e) {
       document.getElementById('panelBody').textContent = 'Error: ' + e.message;
     }
@@ -612,6 +671,53 @@ async function openSession(taskDir, unitId, title, isRunning) {
     logPollInterval = setInterval(fetchSession, 2000);
   }
 }
+
+var expandedMsgs = new Set();
+
+function toggleMsg(btn) {
+  var container = btn.closest('.msg-collapsible');
+  if (!container) return;
+  var id = container.id;
+  if (container.classList.contains('expanded') && !container.classList.contains('short')) {
+    container.classList.remove('expanded');
+    btn.textContent = '▼ Show more';
+    expandedMsgs.delete(id);
+  } else {
+    container.classList.add('expanded');
+    btn.textContent = '▲ Show less';
+    expandedMsgs.add(id);
+  }
+}
+
+// Auto-expand short messages, show fade+button only for overflowing ones
+function initMsgToggles() {
+  document.querySelectorAll('.msg-collapsible').forEach(function(el) {
+    var wrap = el.querySelector('.msg-wrap');
+    var fade = el.querySelector('.msg-fade');
+    if (wrap && wrap.scrollHeight <= 150) {
+      el.classList.add('expanded');
+      el.classList.add('short');
+      if (fade) fade.style.display = 'none';
+    } else if (expandedMsgs.has(el.id)) {
+      el.classList.add('expanded');
+      var btn = el.querySelector('.msg-toggle');
+      if (btn) btn.textContent = '▲ Show less';
+    }
+  });
+}
+
+var _scrollAfterInit = false;
+var panelObserver = new MutationObserver(function() {
+  setTimeout(function() {
+    initMsgToggles();
+    if (_scrollAfterInit) {
+      var body = document.getElementById('panelBody');
+      body.scrollTop = body.scrollHeight;
+      _scrollAfterInit = false;
+    }
+  }, 50);
+});
+panelObserver.observe(document.getElementById('panelBody'), { childList: true, subtree: true });
 
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');

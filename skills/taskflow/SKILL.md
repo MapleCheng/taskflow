@@ -5,168 +5,160 @@ description: "Break issues into ordered unit pipelines and execute them sequenti
 
 # Taskflow — Issue Pipeline Runner
 
-Break issues into self-contained unit files, execute them sequentially. Each unit runs as an independent OpenClaw agent session with full tool access.
+Break issues into self-contained unit files, execute them sequentially. Each unit runs as an independent agent session via the OpenClaw plugin runtime API.
 
 ## Architecture
 
 ```
-Platform (state/flow/verify) → OpenClaw Agent (per unit, has knowledge + tools)
+Plugin (orchestrator) → subagent.run() per unit → agent session
 ```
 
-- **Platform** (deterministic Node.js): reads manifest, finds next pending unit, spawns agent, updates status
-- **Agent** (OpenClaw session): executes unit spec, has memory_recall, file I/O, shell — effectively the SubAgent + Coding CLI in one
+- **Plugin** (in-process): reads manifest, validates schema, finds pending unit, runs agent via runtime API, updates status
+- **Agent** (isolated session): executes unit prompt, has configurable tool access
+
+## Schema
+
+```
+Manifest
+├── id: string             (YYMMDDHHmmss, = folder name)
+├── title: string
+├── session: string        (notification target, e.g. "discord:channel:123")
+├── status: PipelineStatus (pending | running | done | failed | stopped)
+├── createdAt, startedAt?, completedAt?
+├── issues?: Issue[]
+│   └── { url, repo, number, path, branch? }
+├── agent?: AgentConfig    (per-pipeline override)
+│   └── { id?, model?, timeout? }
+└── pipeline: Group[]
+    └── Group { id, title, status, children: Unit[] }
+        └── Unit { id, title, type?, unit?, children?: Unit[], status, ... }
+```
+
+**Rules:**
+- Top-level pipeline items must be Groups (must have children)
+- `unit` and `children` are mutually exclusive on Unit
+- `issue` must match an entry in `issues[].url`
+- `id` must be globally unique across entire pipeline
+
+## Plugin Config
+
+```json
+{
+  "taskflow": {
+    "tasksDir": "~/clawd/tasks",
+    "agent": "main",
+    "model": null,
+    "timeout": 300000
+  }
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `agent` | `"main"` | Agent id for unit execution |
+| `model` | `null` | Model override (null = agent default) |
+| `timeout` | `300000` | Timeout per unit in ms (5 min) |
 
 ## Directory Structure
 
 ```
-~/clawd/tasks/{task-dir}/
-  manifest.json              ← pipeline definition + status tracking
+~/clawd/tasks/{YYMMDDHHmmss}/
+  manifest.json
   units/
-    {id}.md                  ← self-contained unit spec
+    {id}.md                  ← self-contained unit prompt
   logs/
-    {id}.log                 ← execution log per unit
+    {id}.log
 ```
-
-Tasks live under the **clawd workspace**, not in the target repo (avoid polluting git history).
 
 ## Phase 1: Decompose (plan)
 
-Read Issue → break into unit pipeline → produce manifest + unit files.
+Read Issue → break into unit pipeline → use `taskflow_create`.
 
 ### 1.1 Read Issue
 
 ```bash
-# Issue tracker API (Gitea/GitHub/GitLab)
 GET /repos/{owner}/{repo}/issues/{N}
 GET /repos/{owner}/{repo}/issues/{N}/comments
 ```
 
 ### 1.2 Analyze Work Items
 
-Parse `- [ ]` checkboxes from issue body:
-- **Type**: db / backend / frontend / config / other
+Parse checkboxes from issue body:
+- **Type**: db / backend / frontend / config
 - **Dependencies**: execution order
-- **Granularity**: one checkbox may need multiple units (nested children)
+- **Granularity**: one checkbox may need multiple units
 
-### 1.3 Produce manifest.json
+### 1.3 Create Pipeline
 
-```json
-{
-  "issue": "org/repo#21",
-  "repo": "org/repo",
-  "repoPath": "/path/to/repo",
-  "branch": "feature/issue-21",
-  "createdAt": "2026-03-07T15:46:00Z",
-  "status": "pending",
-  "pipeline": [
+```
+taskflow_create({
+  title: "Barcode Migration",
+  session: "discord:channel:123456",
+  issues: [
+    { url: "https://github.com/org/repo/issues/3", repo: "org/repo", number: 3, path: "/path/to/repo", branch: "feature/xxx" }
+  ],
+  units: [
     {
-      "id": "api-pending",
-      "title": "Pending approval API",
-      "type": "backend",
-      "status": "pending",
-      "children": [
-        { "id": "api-pending-1", "title": "DTO definitions", "type": "backend", "status": "pending", "unit": "api-pending-1.md" },
-        { "id": "api-pending-2", "title": "Business logic", "type": "backend", "status": "pending", "unit": "api-pending-2.md" },
-        { "id": "api-pending-3", "title": "Controller endpoint", "type": "backend", "status": "pending", "unit": "api-pending-3.md" }
+      id: "backend",
+      title: "Backend API",
+      children: [
+        { id: "bll", title: "Business logic", type: "backend", issue: "https://...", prompt: "..." },
+        { id: "controller", title: "Controller", type: "backend", issue: "https://...", prompt: "..." }
       ]
-    },
-    {
-      "id": "frontend-1",
-      "title": "Frontend component",
-      "type": "frontend",
-      "status": "pending",
-      "unit": "frontend-1.md"
     }
   ]
-}
+})
 ```
 
-### 1.4 Produce Unit Files
+Auto-generates: id (YYMMDDHHmmss), timestamps, status fields, directory structure, unit .md files.
 
-Each unit file is self-contained with everything needed to execute:
+### 1.4 Report
 
-```markdown
-# Unit: GET /approval/pending
-
-## Task
-Add a GET endpoint for pending approvals.
-
-## Spec
-- Route: GET /approval/pending
-- Query params: PaginationReq
-- Response: PaginationRes<PendingRes>
-- Method: ApprovalBll.GetPendingList(query)
-
-## Acceptance Criteria
-- Build passes
-- Endpoint returns expected response shape
-```
-
-### 1.5 Report
-
-After decomposition, report to user:
-- Number of units (including nested)
-- Pipeline order
-- Let user confirm or adjust
+After creation, report `tag` (e.g. `[260310235823] Barcode Migration`) and let user confirm before running.
 
 ## Phase 2: Execute (run)
 
-Use the `taskflow_run` tool to start pipeline execution.
+Use `taskflow_run` to start.
 
-### 2.1 Find Next Unit
+### 2.1 Multi-Repo Support
 
-Depth-first traversal of manifest:
-1. Find first leaf node with `status: "pending"`
-2. All preceding siblings must be `done` (sequential execution)
+Each unit's `issue` field → matched to `issues[].url` → uses `issues[].path` as working directory.
 
-### 2.2 Spawn Agent
+### 2.2 Agent Execution
 
-Each unit gets its own OpenClaw agent session:
-- Session ID: `taskflow-{taskDir}-{unitId}`
-- Agent receives unit spec as prompt
-- Agent has full tool access (memory_recall, exec, read, write)
+Each unit gets its own session via `subagent.run()`:
+- Session key: `taskflow-{pipelineId}-{unitId}`
+- Agent receives unit prompt
+- Completion detected via `waitForRun()`
 
-### 2.3 Update Status
+### 2.3 Status Updates
 
 After each unit:
-1. Parse agent result (done/failed)
-2. Update manifest: `status`, `completedAt`, `note` or `error`
-3. Parent auto-done: all children done → parent marked done
-4. Failed → stop pipeline, send notification
+1. Parse result (done/failed)
+2. Update manifest
+3. All children done → parent marked done
+4. Failed → stop pipeline, notify
 
 ### 2.4 Notification
 
-Pipeline complete or stopped → `openclaw message send` to configured channel.
+Pipeline complete/stopped → system event to `manifest.session`.
 
 ## Phase 3: Report (status)
 
-Use the `taskflow_status` or `taskflow_list` tools to check progress.
+Use `taskflow_status` or `taskflow_list`.
 
-## Commands
+## Tools
 
-| User Says | Action |
-|-----------|--------|
-| "Decompose issue org/repo#21" | Phase 1: decompose |
-| "Run pipeline" / "Continue" | Phase 2: execute from next pending |
-| "Pipeline status" | Phase 3: report progress |
-| "Rerun {unit-id}" | Reset unit to pending, re-execute |
-| "Skip {unit-id}" | Mark as skipped, continue |
-
-## ⚠️ Manifest Write-back (mandatory)
-
-After each unit completes, manifest.json MUST be updated:
-
-1. Read `~/clawd/tasks/{dir}/manifest.json`
-2. Update unit: `status` (done/failed), `completedAt`, `note`/`error`
-3. Check parent: all children done → parent marked done
-4. All done → top-level `status` → `done` + `completedAt`
-
-**Not optional.** No manifest update = dashboard shows no progress = nothing happened.
+| Tool | Description |
+|------|-------------|
+| `taskflow_create` | Create pipeline with manifest and unit files |
+| `taskflow_run` | Start pipeline execution |
+| `taskflow_status` | Get pipeline status |
+| `taskflow_list` | List all pipelines |
 
 ## Notes
 
-1. **Sequential execution**: one unit completes before the next starts
-2. **Stub strategy**: use stubs to prevent build failures when dependencies aren't ready
-3. **Accuracy over speed**: every issue goes through the pipeline
-4. **Manifest is source of truth**: progress tracking, reruns, skips all use manifest
-5. **Fully autonomous**: user triggers once, gets notified only on failure or completion
+1. **Sequential execution**: one unit at a time
+2. **No child processes**: everything runs in-process via plugin runtime API
+3. **Manifest is source of truth**: progress, reruns, skips all use manifest
+4. **Fully autonomous**: trigger once, get notified on completion or failure

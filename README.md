@@ -5,23 +5,24 @@ An [OpenClaw](https://github.com/openclaw/openclaw) plugin for autonomous pipeli
 ## How It Works
 
 ```
-Platform (deterministic runner) → OpenClaw Agent (per unit) → exec / tools
+Plugin (orchestrator) → subagent.run() per unit → agent session with tools
 ```
 
 1. **Decompose** — Break an issue into self-contained unit files with a manifest
-2. **Execute** — Platform spawns one OpenClaw agent session per unit, sequentially
+2. **Execute** — Plugin runs one agent session per unit via the OpenClaw runtime API
 3. **Track** — Real-time dashboard shows progress, logs, and session transcripts
 
-Each unit runs as an independent agent session with full tool access (file I/O, shell, memory, web search, etc.). The platform manages state — agents just do work.
+Each unit runs as an independent agent session. The plugin manages state — agents just do work.
 
 ## Features
 
 - 🔄 **Sequential pipeline execution** with nested unit support
 - 📊 **Real-time dashboard** (PWA, dark theme, mobile responsive)
 - 🔐 **Token-based auth** with HMAC signing and per-device binding
-- 🔔 **Auto-notify** — notifies whoever triggered the pipeline, on any channel
-- 🔗 **Issue tracker integration** (GitHub, GitLab, Gitea, etc.)
+- 🔔 **Auto-notify** via system events to the triggering session
+- 🔗 **Multi-repo support** — each unit can target a different repo
 - 📝 **Session viewer** — inspect agent reasoning for each unit
+- 🤖 **Agent isolation** — configurable agent id for role/tool separation
 - ⚡ **Fully autonomous** — trigger once, get notified on completion or failure
 
 ## Installation
@@ -44,10 +45,12 @@ Add to your `openclaw.json`:
       "taskflow": {
         "enabled": true,
         "config": {
-          "tasksDir": "<path-to-your-tasks-directory>",
+          "tasksDir": "~/clawd/tasks",
           "dashboardPort": 3847,
           "dashboardSecret": "<your-random-secret>",
-          "issueBaseUrl": "<your-issue-tracker-url>"
+          "agent": "main",
+          "model": null,
+          "timeout": 300000
         }
       }
     }
@@ -57,14 +60,14 @@ Add to your `openclaw.json`:
 
 ### Config
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `tasksDir` | ✅ | Path to the directory containing task folders |
-| `dashboardPort` | | Dashboard port (default: `3847`) |
-| `dashboardSecret` | | HMAC secret for dashboard auth. Omit for open access |
-| `issueBaseUrl` | | Base URL for issue links (e.g. `https://github.com`) |
-| `notify.channel` | | Fallback notification channel. Auto-detected from triggering session |
-| `notify.target` | | Fallback notification target. Auto-detected from triggering session |
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `tasksDir` | ✅ | `~/clawd/tasks` | Directory containing task folders |
+| `dashboardPort` | | `3847` | Dashboard port |
+| `dashboardSecret` | | | HMAC secret for dashboard auth |
+| `agent` | | `"main"` | Agent id for unit execution. Set to a custom agent for tool isolation |
+| `model` | | `null` | Model override for unit sessions (null = agent default) |
+| `timeout` | | `300000` | Timeout per unit in ms (5 min) |
 
 ## Dashboard
 
@@ -78,61 +81,40 @@ pm2 save
 Generate an auth token:
 
 ```bash
-node plugins/taskflow/dashboard/gen-token.cjs new    # Generate token for a new device
-node plugins/taskflow/dashboard/gen-token.cjs list   # List bound devices
-node plugins/taskflow/dashboard/gen-token.cjs clear  # Clear all device bindings
+node plugins/taskflow/dashboard/gen-token.cjs new
 ```
 
-Visit `https://your-domain/?token=<generated-token>` to bind your device. After binding, the token is stored as a cookie — subsequent visits don't need the token.
+Visit `https://your-domain/?token=<token>` to bind your device.
 
-## Task Structure
+## Schema
+
+### Manifest v2
 
 ```
-<tasksDir>/
-  my-task/
-    manifest.json       ← Pipeline definition + status tracking
-    units/
-      setup-1.md        ← Self-contained unit spec
-      setup-2.md
-      core-1.md
-    logs/
-      setup-1.log       ← Execution log per unit
-```
-
-### manifest.json
-
-```json
-{
-  "issue": "org/repo#42",
-  "repo": "org/repo",
-  "repoPath": "/path/to/local/repo",
-  "branch": "feature/issue-42",
-  "status": "pending",
-  "pipeline": [
-    {
-      "id": "setup",
-      "title": "Project setup",
-      "type": "config",
-      "status": "pending",
-      "children": [
-        { "id": "setup-1", "title": "Initialize project", "status": "pending", "unit": "setup-1.md" },
-        { "id": "setup-2", "title": "Create boilerplate", "status": "pending", "unit": "setup-2.md" }
-      ]
-    },
-    {
-      "id": "test-1",
-      "title": "Integration tests",
-      "type": "backend",
-      "status": "pending",
-      "unit": "test-1.md"
-    }
-  ]
-}
+Manifest
+├── id: string             (YYMMDDHHmmss, = folder name)
+├── title: string
+├── session: string        (notification target, e.g. "discord:channel:123")
+├── status: PipelineStatus
+├── createdAt, startedAt?, completedAt?
+├── issues?: Issue[]
+│   └── { url, repo, number, path, branch? }
+├── agent?: AgentConfig
+│   └── { id?, model?, timeout? }
+└── pipeline: Group[]
+    └── Group
+        ├── id, title, status
+        └── children: Unit[]
+            └── Unit
+                ├── id, title, type?, status
+                ├── unit? (filename), issue?
+                ├── children?: Unit[]  (recursive nesting)
+                └── startedAt?, completedAt?, note?, error?
 ```
 
 ### Unit Files
 
-Each `.md` file is a self-contained spec with everything an agent needs:
+Each `.md` file in `units/` is a self-contained prompt:
 
 ```markdown
 # Unit: Create user endpoint
@@ -143,7 +125,6 @@ Add a POST /api/users endpoint.
 ## Spec
 - Validate input (name required, email format)
 - Return 201 with created user
-- Return 400 on validation error
 
 ## Acceptance Criteria
 - Endpoint works as specified
@@ -152,21 +133,33 @@ Add a POST /api/users endpoint.
 
 ## Tools
 
-The plugin registers three tools:
-
 | Tool | Description |
 |------|-------------|
-| `taskflow_run` | Start pipeline execution for a task directory |
+| `taskflow_create` | Create a new pipeline with manifest and unit files |
+| `taskflow_run` | Start pipeline execution |
 | `taskflow_status` | Get pipeline status and unit progress |
 | `taskflow_list` | List all task directories and their status |
 
-## Security
+## Architecture
 
-- Dashboard runs on a separate port (never on the gateway port)
-- Auth uses HMAC-SHA256 signing with timing-safe comparison
-- Each token is bound to one device (cookie-based)
-- Bot user agents are blocked from triggering device binding
-- Dashboard secret is stored in OpenClaw config, never in plugin source
+```
+Plugin (index.ts)
+├── taskflow_create  → generates manifest + unit files
+├── taskflow_run     → calls subagent.run() per unit via runtime API
+├── taskflow_status  → reads manifest
+└── taskflow_list    → scans tasks dir
+
+Platform (src/platform.js)
+├── runPipeline()    → sequential executor loop
+├── findNextPending()→ tree traversal
+├── validateManifest()→ schema validation
+└── executeUnit()    → delegates to injected executor
+
+Types (src/types.ts)
+└── Manifest, Group, Unit, Issue, AgentConfig, UnitExecutor
+```
+
+No child processes. No CLI shelling. Everything runs in-process via the OpenClaw plugin runtime API.
 
 ## License
 

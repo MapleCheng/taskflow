@@ -7,40 +7,160 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { Manifest, Group, Unit, Issue, TaskflowPluginConfig, UnitExecutor, UnitResult } from "./src/types.js";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
-import { execSync, spawn as nodeSpawn } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import { fileURLToPath } from "node:url";
 
-interface PluginConfig {
-  tasksDir?: string;
-  dashboardPort?: number;
-  dashboardSecret?: string;
-  issueBaseUrl?: string;
-  notify?: {
-    channel?: string;
-    target?: string;
-  };
-}
-
 // Running pipelines tracked in memory
-const runningPipelines = new Map<string, { pid?: number; startedAt: string }>();
+const runningPipelines = new Map<string, { startedAt: string }>();
 
-// Shared reference to plugin API for notification
+// Shared reference to plugin API
 let pluginApi: OpenClawPluginApi | null = null;
-let pluginConfig: PluginConfig = {};
 
 export default {
   register(api: OpenClawPluginApi) {
     pluginApi = api;
-    const config: PluginConfig = (api.pluginConfig || {}) as PluginConfig;
-    pluginConfig = config;
+    const config = (api.pluginConfig || {}) as TaskflowPluginConfig;
     const tasksDir = api.resolvePath(config.tasksDir || join(homedir(), "clawd", "tasks"));
     const dashboardPort = config.dashboardPort || 3847;
-    const issueBaseUrl = config.issueBaseUrl || "";
     const __dirname = dirname(fileURLToPath(import.meta.url));
+
+    // ── Tool: taskflow_create ──
+    api.registerTool(() => ({
+      name: "taskflow_create",
+      label: "Create Taskflow Pipeline",
+      description: "Create a new taskflow pipeline with manifest and unit files. Auto-generates id, timestamps, and status fields.",
+      parameters: Type.Object({
+        title: Type.String({ description: "Pipeline title (human-readable name)" }),
+        session: Type.String({ description: "OpenClaw session id for notifications (e.g. discord:channel:123)" }),
+        issues: Type.Optional(Type.Array(Type.Object({
+          url: Type.String({ description: "Issue URL (e.g. https://gitea.example.com/org/repo/issues/3)" }),
+          repo: Type.String({ description: "Repo short name (e.g. org/repo)" }),
+          number: Type.Number({ description: "Issue number" }),
+          path: Type.String({ description: "Local repo path" }),
+          branch: Type.Optional(Type.String({ description: "Git branch name" })),
+        }), { description: "Related issues with repo info" })),
+        units: Type.Array(Type.Object({
+          id: Type.String({ description: "Unique unit id" }),
+          title: Type.String({ description: "Unit title" }),
+          issue: Type.Optional(Type.String({ description: "Issue URL this unit belongs to (must match issues[].url)" })),
+          prompt: Type.Optional(Type.String({ description: "Unit prompt content (for leaf units)" })),
+          children: Type.Optional(Type.Array(Type.Object({
+            id: Type.String(),
+            title: Type.String(),
+            type: Type.Optional(Type.String({ description: "Unit type (e.g. backend, frontend, db, config)" })),
+            issue: Type.Optional(Type.String()),
+            prompt: Type.String({ description: "Unit prompt content" }),
+          }))),
+        }), { description: "Pipeline units (leaf with prompt, or group with children)", minItems: 1 }),
+      }),
+      async execute(_toolCallId: string, params: {
+        title: string;
+        session: string;
+        issues?: Array<{ url: string; repo: string; number: number; path: string; branch?: string }>;
+        units: Array<{
+          id: string;
+          title: string;
+          issue?: string;
+          prompt?: string;
+          children?: Array<{ id: string; title: string; issue?: string; prompt: string }>;
+        }>;
+      }) {
+        const { title, session, issues, units } = params;
+
+        // Generate unique id
+        // Generate id from current timestamp: tf-YYYYMMDDHHmmss (+ suffix if collision)
+        const now = new Date();
+        const base = "" + String(now.getFullYear()).slice(2)
+          + String(now.getMonth() + 1).padStart(2, "0")
+          + String(now.getDate()).padStart(2, "0")
+          + String(now.getHours()).padStart(2, "0")
+          + String(now.getMinutes()).padStart(2, "0")
+          + String(now.getSeconds()).padStart(2, "0");
+        let id = base;
+        let suffix = 1;
+        while (existsSync(join(tasksDir, id))) {
+          id = base + "-" + suffix++;
+        }
+        const taskPath = join(tasksDir, id);
+        const unitsPath = join(taskPath, "units");
+
+        // Build pipeline structure and collect unit files to write
+        const unitFiles: Array<{ filename: string; content: string }> = [];
+        const pipeline: Group[] = units.map(u => {
+          const children: Unit[] = (u.children || []).map(c => {
+            const filename = `${c.id}.md`;
+            unitFiles.push({ filename, content: c.prompt });
+            return {
+              id: c.id,
+              title: c.title,
+              ...(c.type ? { type: c.type } : {}),
+              ...(c.issue ? { issue: c.issue } : {}),
+              unit: filename,
+              status: "pending" as const,
+            };
+          });
+          return {
+            id: u.id,
+            title: u.title,
+            status: "pending" as const,
+            children,
+          };
+        });
+
+        // Build manifest
+        const manifest: Manifest = {
+          id,
+          title,
+          session,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          startedAt: null,
+          completedAt: null,
+          ...(issues && issues.length > 0 ? { issues: issues as Issue[] } : {}),
+          pipeline,
+        };
+
+        // Validate before writing
+        // Dynamic import to avoid TS issues with .js
+        const { validateManifest: validate } = await import("./src/platform.js");
+        const validation = validate(manifest);
+        if (!validation.valid) {
+          return {
+            error: "Manifest validation failed",
+            details: validation.errors,
+          };
+        }
+
+        // Create directories
+        mkdirSync(unitsPath, { recursive: true });
+
+        // Write unit files
+        for (const uf of unitFiles) {
+          writeFileSync(join(unitsPath, uf.filename), uf.content);
+        }
+
+        // Write manifest
+        writeFileSync(join(taskPath, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+
+        return {
+          id,
+          tag: `[${id}] ${title}`,
+          title,
+          path: taskPath,
+          unitCount: unitFiles.length,
+          pipeline: pipeline.map(g => ({
+            id: g.id,
+            title: g.title,
+            children: g.children.map(c => ({ id: c.id, title: c.title })),
+          })),
+          warnings: validation.warnings.length > 0 ? validation.warnings : undefined,
+        };
+      },
+    }));
 
     // ── Tool: taskflow_run ──
     api.registerTool(() => ({
@@ -49,10 +169,9 @@ export default {
       description: "Start a taskflow pipeline for a task directory. Runs in background, sends notification on completion.",
       parameters: Type.Object({
         taskDir: Type.String({ description: "Task directory name (e.g. DEMO-python-hello)" }),
-        mode: Type.Optional(Type.String({ description: "Execution mode: 'direct' (bash) or 'agent' (openclaw agent per unit). Default: agent" })),
       }),
-      async execute(_toolCallId: string, params: { taskDir: string; mode?: string }) {
-        const { taskDir, mode = "agent" } = params;
+      async execute(_toolCallId: string, params: { taskDir: string }) {
+        const { taskDir } = params;
         const manifestPath = join(tasksDir, taskDir, "manifest.json");
 
         if (!existsSync(manifestPath)) {
@@ -63,36 +182,91 @@ export default {
           return { error: `Pipeline ${taskDir} is already running` };
         }
 
-        // Reset manifest
-        const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+        runningPipelines.set(taskDir, { startedAt: new Date().toISOString() });
 
-        // Fork the platform runner as a child process
-        // Pass notify context from the triggering session
-        const platformPath = join(__dirname, "src", "platform-cli.js");
-        const notifyChannel = (api as any).currentInbound?.channel || config.notify?.channel || "";
-        const notifyTarget = (api as any).currentInbound?.chatId || config.notify?.target || "";
-        const child = nodeSpawn("node", [platformPath, tasksDir, taskDir, mode], {
-          detached: true,
-          stdio: "ignore",
-          env: {
-            ...process.env,
-            TASKFLOW_NOTIFY_CHANNEL: notifyChannel,
-            TASKFLOW_NOTIFY_TARGET: notifyTarget,
+        // Build executor using plugin runtime API
+        const agentId = config.agent || "main";
+        const unitTimeout = config.timeout || 300000;
+
+        const executor: UnitExecutor = async (sessionKey, prompt) => {
+          // Use subagent.run() to execute the unit
+          const { runId } = await api.runtime.subagent.run({
+            sessionKey,
+            message: prompt,
+            lane: agentId !== "main" ? agentId : undefined,
+            idempotencyKey: `taskflow-${sessionKey}-${Date.now()}`,
+          });
+
+          // Wait for completion
+          const waitResult = await api.runtime.subagent.waitForRun({
+            runId,
+            timeoutMs: unitTimeout,
+          });
+
+          if (waitResult.status === "timeout") {
+            return { status: "failed", error: `Unit timed out after ${unitTimeout}ms`, sessionKey };
+          }
+          if (waitResult.status === "error") {
+            return { status: "failed", error: waitResult.error || "Agent error", sessionKey };
+          }
+
+          // Read session messages to extract result
+          const { messages } = await api.runtime.subagent.getSessionMessages({
+            sessionKey,
+            limit: 5,
+          });
+
+          // Find the last assistant message with a JSON status
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i] as any;
+            if (msg.role === "assistant" && msg.content) {
+              const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+              const lines = text.trim().split("\n");
+              for (let j = lines.length - 1; j >= Math.max(0, lines.length - 5); j--) {
+                try {
+                  const parsed = JSON.parse(lines[j].trim());
+                  if (parsed.status) return { ...parsed, sessionKey };
+                } catch (_) {}
+              }
+            }
+          }
+
+          return { status: "done", summary: "Agent completed (no explicit status)", sessionKey };
+        };
+
+        // Notification via system event
+        const onNotify = (message: string, manifest: Manifest) => {
+          if (manifest.session) {
+            try {
+              api.runtime.system.enqueueSystemEvent(message, {
+                sessionKey: manifest.session,
+              });
+            } catch (e) {
+              api.logger.warn(`taskflow: notification failed: ${(e as Error).message}`);
+            }
+          }
+        };
+
+        // Run pipeline in background (non-blocking)
+        const { runPipeline } = await import("./src/platform.js");
+        runPipeline(tasksDir, taskDir, {
+          executor,
+          onNotify,
+          logger: {
+            info: (msg: string) => api.logger.info(`taskflow[${taskDir}]: ${msg}`),
+            warn: (msg: string) => api.logger.warn(`taskflow[${taskDir}]: ${msg}`),
+            error: (msg: string) => api.logger.error(`taskflow[${taskDir}]: ${msg}`),
           },
-        });
-        child.unref();
-
-        runningPipelines.set(taskDir, { pid: child.pid, startedAt: new Date().toISOString() });
-
-        child.on("exit", () => {
+        }).catch((e: Error) => {
+          api.logger.error(`taskflow[${taskDir}]: Fatal: ${e.message}`);
+        }).finally(() => {
           runningPipelines.delete(taskDir);
         });
 
         return {
           status: "started",
           taskDir,
-          mode,
-          pid: child.pid,
+          agent: agentId,
           dashboard: `http://localhost:${dashboardPort}`,
         };
       },
@@ -115,11 +289,11 @@ export default {
         }
 
         try {
-          const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+          const manifest: Manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
           const stats = countStats(manifest.pipeline);
           return {
             task: taskDir,
-            issue: manifest.issue,
+            title: manifest.title,
             status: manifest.status,
             stats,
             startedAt: manifest.startedAt,
@@ -148,11 +322,11 @@ export default {
           .filter(d => d.isDirectory() && existsSync(join(tasksDir, d.name, "manifest.json")))
           .map(d => {
             try {
-              const m = JSON.parse(readFileSync(join(tasksDir, d.name, "manifest.json"), "utf-8"));
+              const m: Manifest = JSON.parse(readFileSync(join(tasksDir, d.name, "manifest.json"), "utf-8"));
               const stats = countStats(m.pipeline);
               return {
                 name: d.name,
-                issue: m.issue,
+                title: m.title,
                 status: m.status || "pending",
                 stats,
                 running: runningPipelines.has(d.name),
@@ -192,47 +366,20 @@ export default {
   },
 };
 
-// ── Notification (called from platform-cli via IPC or direct import) ──
-
-export async function sendNotification(taskDir: string, stats: { total: number; done: number; failed: number }, manifest: any) {
-  const config = pluginConfig;
-  const channel = config.notify?.channel;
-  const target = config.notify?.target;
-
-  if (!channel || !target) return;
-
-  const text = [
-    `🔥 **Taskflow ${stats.failed > 0 ? 'Stopped' : 'Complete'}**`,
-    ``,
-    `**${manifest.issue || taskDir}** — ${stats.done}/${stats.total} done, ${stats.failed} failed`,
-    manifest.branch ? `Branch: \`${manifest.branch}\`` : null,
-  ].filter(Boolean).join('\n');
-
-  // Send via openclaw message send (channel-agnostic)
-  try {
-    execSync(
-      `openclaw message send --channel ${channel} --target ${JSON.stringify(target)} --message ${JSON.stringify(text)}`,
-      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-  } catch (e) {
-    // Silent fail — notification is best-effort
-  }
-}
-
 // ── Helpers ──
 
-function countStats(nodes: any[]): { total: number; done: number; failed: number; running: number; blocked: number } {
+function countStats(groups: Group[]) {
   let total = 0, done = 0, failed = 0, running = 0, blocked = 0;
-  function walk(list: any[]) {
-    for (const n of list) {
-      if (n.children?.length) { walk(n.children); continue; }
+  function walkUnits(units: Unit[]) {
+    for (const u of units) {
+      if (u.children?.length) { walkUnits(u.children); continue; }
       total++;
-      if (n.status === "done") done++;
-      else if (n.status === "failed") failed++;
-      else if (n.status === "running") running++;
-      else if (n.status === "blocked") blocked++;
+      if (u.status === "done") done++;
+      else if (u.status === "failed") failed++;
+      else if (u.status === "running") running++;
+      else if (u.status === "blocked") blocked++;
     }
   }
-  walk(nodes);
+  for (const g of groups) walkUnits(g.children);
   return { total, done, failed, running, blocked };
 }

@@ -2,7 +2,7 @@
   "id": "taskflow",
   "name": "Taskflow",
   "description": "Three-layer autonomous pipeline runner: Platform (state/flow) → SubAgent (knowledge) → Coding CLI (code). Includes dashboard and notification.",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "kind": "tool",
   "skills": ["skills/taskflow"],
   "configSchema": {
@@ -24,25 +24,21 @@
         "type": "string",
         "description": "HMAC signing secret for dashboard auth. Token = HMAC-SHA256(secret, 'taskflow-dashboard')."
       },
-      "issueBaseUrl": {
+      "agent": {
         "type": "string",
-        "default": "",
-        "description": "Base URL for issue links (Gitea, GitHub, GitLab, etc.)"
+        "default": "main",
+        "description": "Agent id for unit execution (default: main). Set to a custom agent for role/tool isolation."
       },
-      "notify": {
-        "type": "object",
-        "description": "Fallback notification target. Auto-detected from triggering session when omitted.",
-        "additionalProperties": false,
-        "properties": {
-          "channel": {
-            "type": "string",
-            "description": "Notification channel (discord, telegram, etc.)"
-          },
-          "target": {
-            "type": "string",
-            "description": "Notification target (e.g. channel:123456789)"
-          }
-        }
+      "model": {
+        "type": ["string", "null"],
+        "default": null,
+        "description": "Model override for unit agent sessions (null = use agent default)"
+      },
+      "timeout": {
+        "type": "integer",
+        "minimum": 10000,
+        "default": 300000,
+        "description": "Timeout per unit execution in ms (default: 300000 = 5 min)"
       }
     }
   },
@@ -59,14 +55,6 @@
       "label": "Dashboard Secret",
       "sensitive": true,
       "help": "HMAC signing secret. Token is derived via HMAC-SHA256."
-    },
-    "notify.channel": {
-      "label": "Notification Channel",
-      "placeholder": "discord"
-    },
-    "notify.target": {
-      "label": "Notification Target",
-      "placeholder": "channel:123456789"
     }
   }
 }
