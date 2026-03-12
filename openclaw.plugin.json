@@ -24,6 +24,11 @@
         "type": "string",
         "description": "HMAC signing secret for dashboard auth. Token = HMAC-SHA256(secret, 'taskflow-dashboard')."
       },
+      "systemPrompt": {
+        "type": "string",
+        "default": "",
+        "description": "Optional global system prompt layered into extraSystemPrompt for every unit"
+      },
       "agent": {
         "type": "string",
         "default": "main",
@@ -39,6 +44,12 @@
         "minimum": 10000,
         "default": 300000,
         "description": "Timeout per unit execution in ms (default: 300000 = 5 min)"
+      },
+      "runtime": {
+        "type": "string",
+        "enum": ["subagent"],
+        "default": "subagent",
+        "description": "Default runtime mode for unit execution. Resolution order: taskflow_run override → manifest.runtime → manifest.agent.runtime → plugin config."
       }
     }
   },

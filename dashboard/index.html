@@ -401,7 +401,7 @@
 
 
 function statusIcon(s) {
-  return { done: '✅', failed: '❌', running: '🔄', pending: '⏳', skipped: '⏭️' }[s] || '❓';
+  return { done: '✅', failed: '❌', running: '🔄', pending: '⏳', skipped: '⏭️', cancelled: '🛑', stopped: '🛑' }[s] || '❓';
 }
 
 function statusClass(s) {
@@ -411,14 +411,16 @@ function statusClass(s) {
 function overallStatus(stats) {
   if (stats.failed > 0) return 'failed';
   if (stats.running > 0) return 'running';
-  if (stats.done === stats.total && stats.total > 0) return 'done';
+  if (stats.cancelled > 0) return 'stopped';
+  if (stats.done + stats.cancelled === stats.total && stats.total > 0) return 'done';
   return 'pending';
 }
 
 function overallLabel(stats) {
   if (stats.failed > 0) return 'Failed';
   if (stats.running > 0) return 'Running';
-  if (stats.done === stats.total && stats.total > 0) return 'Done';
+  if (stats.cancelled > 0) return 'Stopped';
+  if (stats.done + stats.cancelled === stats.total && stats.total > 0) return 'Done';
   return 'Pending';
 }
 
@@ -511,6 +513,7 @@ function renderTask(task) {
     stats.done > 0 ? `<div class="progress-done" style="width:${(stats.done/stats.total)*100}%"></div>` : '',
     stats.failed > 0 ? `<div class="progress-failed" style="width:${(stats.failed/stats.total)*100}%"></div>` : '',
     stats.running > 0 ? `<div class="progress-running" style="width:${(stats.running/stats.total)*100}%"></div>` : '',
+    stats.cancelled > 0 ? `<div class="progress-skipped" style="width:${(stats.cancelled/stats.total)*100}%"></div>` : '',
     stats.skipped > 0 ? `<div class="progress-skipped" style="width:${(stats.skipped/stats.total)*100}%"></div>` : '',
   ].join('');
 
@@ -536,8 +539,11 @@ function renderTask(task) {
         <span><span class="dot" style="background:var(--failed)"></span> Failed ${stats.failed}</span>
         <span><span class="dot" style="background:var(--running)"></span> Running ${stats.running}</span>
         <span><span class="dot" style="background:var(--pending)"></span> Pending ${stats.pending}</span>
+        ${stats.cancelled > 0 ? `<span><span class="dot" style="background:var(--skipped)"></span> Cancelled ${stats.cancelled}</span>` : ''}
         ${stats.skipped > 0 ? `<span><span class="dot" style="background:var(--skipped)"></span> Skipped ${stats.skipped}</span>` : ''}
       </div>
+
+      ${task.status === 'running' ? `<div style="margin-top:12px"><button class="pipeline-toggle" onclick="stopTask('${task._dir}')" style="border-color:rgba(239,68,68,0.45);color:#fecaca">🛑 Stop Pipeline</button></div>` : ''}
 
       <div class="pipeline">
         <button class="pipeline-toggle" onclick="togglePipeline('${task._dir}', this)">
@@ -573,10 +579,48 @@ async function openUnit(taskDir, unitFile, title) {
 }
 
 let logPollInterval = null;
+let taskManifests = {};
+
+function getExtraSystemPromptLayers(taskDir, unitId) {
+  var task = taskManifests[taskDir];
+  if (!task) return [];
+  var layers = [];
+  if (task.systemPrompt) layers.push(task.systemPrompt);
+
+  function walk(items, ancestors) {
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var children = item.children || item.units || [];
+      if (children.length > 0) {
+        var groupLayers = ancestors.slice();
+        if (item.systemPrompt) groupLayers.push(item.systemPrompt);
+        walk(children, groupLayers);
+      } else {
+        if (item.id === unitId) {
+          for (var j = 0; j < ancestors.length; j++) layers.push(ancestors[j]);
+          if (item.systemPrompt) layers.push(item.systemPrompt);
+          return;
+        }
+      }
+    }
+  }
+  walk(task.pipeline || [], []);
+  return layers.filter(function(s) { return s && s.trim(); });
+}
 
 async function openCombined(taskDir, unitFile, unitId, title, isRunning) {
   openPanel(title);
   if (logPollInterval) clearInterval(logPollInterval);
+
+  var extraLayers = getExtraSystemPromptLayers(taskDir, unitId);
+  var extraHtml = '';
+  if (extraLayers.length > 0) {
+    var layerContent = extraLayers.map(function(s) { return escapeHtml(s); }).join('\n<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">\n');
+    extraHtml = '<details open style="margin-bottom:20px;padding:16px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
+      '<summary style="font-size:11px;color:var(--text-dim);cursor:pointer;margin-bottom:8px">' +
+      '\uD83D\uDD27 Extra System Prompt</summary>' +
+      '<div style="white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5">' + layerContent + '</div></details>';
+  }
 
   var unitHtml = '';
   // Load unit spec
@@ -616,10 +660,10 @@ async function openCombined(taskDir, unitFile, unitId, title, isRunning) {
       }
       var body = document.getElementById('panelBody');
       var isAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 50;
-      body.innerHTML = unitHtml + sessionHtml || unitHtml + '<div style="color:var(--text-dim)">(no session yet)</div>';
+      body.innerHTML = extraHtml + unitHtml + sessionHtml || extraHtml + unitHtml + '<div style="color:var(--text-dim)">(no session yet)</div>';
       if (isAtBottom) _scrollAfterInit = true;
     } catch(e) {
-      document.getElementById('panelBody').innerHTML = unitHtml + '<div style="color:var(--text-dim)">Session error: ' + e.message + '</div>';
+      document.getElementById('panelBody').innerHTML = extraHtml + unitHtml + '<div style="color:var(--text-dim)">Session error: ' + e.message + '</div>';
     }
   };
 
@@ -744,10 +788,29 @@ function togglePipeline(dir, btn) {
   content.classList.toggle('collapsed');
 }
 
+async function stopTask(taskId) {
+  const ok = confirm(`Stop pipeline ${taskId}?`);
+  if (!ok) return;
+  try {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'Dashboard stop button' }),
+    });
+    const data = await res.json();
+    if (!res.ok && data.error) throw new Error(data.error);
+    await refresh();
+  } catch (e) {
+    alert(`Stop failed: ${e.message}`);
+  }
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/tasks');
     const tasks = await res.json();
+
+    tasks.forEach(function(t) { taskManifests[t._dir] = t; });
 
     if (tasks.length === 0) {
       document.getElementById('app').innerHTML = `

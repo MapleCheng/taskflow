@@ -10,10 +10,10 @@ Break issues into self-contained unit files, execute them sequentially. Each uni
 ## Architecture
 
 ```
-Plugin (orchestrator) → subagent.run() per unit → agent session
+Plugin (orchestrator) → runtime adapter (subagent) per unit → agent session
 ```
 
-- **Plugin** (in-process): reads manifest, validates schema, finds pending unit, runs agent via runtime API, updates status
+- **Plugin** (in-process): reads manifest, validates schema, finds pending unit, selects the already-decided runtime from manifest/config/run override, runs agent via runtime API, updates status
 - **Agent** (isolated session): executes unit prompt, has configurable tool access
 
 ## Schema
@@ -27,8 +27,11 @@ Manifest
 ├── createdAt, startedAt?, completedAt?
 ├── issues?: Issue[]
 │   └── { url, repo, number, path, branch? }
+├── systemPrompt?: string  (optional pipeline-level system prompt)
 ├── agent?: AgentConfig    (per-pipeline override)
-│   └── { id?, model?, timeout? }
+│   └── { id?, model?, timeout?, runtime? }
+├── runtime?: { mode: "subagent", source?: string }  (explicit runtime from dev skill / pipeline authoring)
+├── run?: { runtime?: { mode, source }, startedAt?, completedAt? }  (effective runtime for latest run)
 └── pipeline: Group[]
     └── Group { id, title, status, children: Unit[] }
         └── Unit { id, title, type?, unit?, children?: Unit[], status, ... }
@@ -46,18 +49,22 @@ Manifest
 {
   "taskflow": {
     "tasksDir": "~/clawd/tasks",
+    "systemPrompt": "",
     "agent": "main",
     "model": null,
-    "timeout": 300000
+    "timeout": 300000,
+    "runtime": "subagent"
   }
 }
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `systemPrompt` | `""` | Global system prompt layered into extraSystemPrompt |
 | `agent` | `"main"` | Agent id for unit execution |
 | `model` | `null` | Model override (null = agent default) |
 | `timeout` | `300000` | Timeout per unit in ms (5 min) |
+| `runtime` | `"subagent"` | Default runtime mode. Resolution: taskflow_run override → manifest.runtime → manifest.agent.runtime → plugin config → subagent |
 
 ## Directory Structure
 
@@ -94,16 +101,18 @@ Parse checkboxes from issue body:
 taskflow_create({
   title: "Barcode Migration",
   session: "discord:channel:123456",
+  systemPrompt: "This project uses .NET Core + React...",
   issues: [
     { url: "https://github.com/org/repo/issues/3", repo: "org/repo", number: 3, path: "/path/to/repo", branch: "feature/xxx" }
   ],
   units: [
     {
-      id: "backend",
+      id: "a",
       title: "Backend API",
+      systemPrompt: "use coding skill to call coding CLI",
       children: [
-        { id: "bll", title: "Business logic", type: "backend", issue: "https://...", prompt: "..." },
-        { id: "controller", title: "Controller", type: "backend", issue: "https://...", prompt: "..." }
+        { id: "a1", title: "Business logic", type: "backend", issue: "https://...", prompt: "..." },
+        { id: "a2", title: "Controller", type: "backend", issue: "https://...", prompt: "..." }
       ]
     }
   ]
@@ -126,10 +135,13 @@ Each unit's `issue` field → matched to `issues[].url` → uses `issues[].path`
 
 ### 2.2 Agent Execution
 
-Each unit gets its own session via `subagent.run()`:
-- Session key: `taskflow-{pipelineId}-{unitId}`
-- Agent receives unit prompt
-- Completion detected via `waitForRun()`
+Each unit gets its own session via the selected runtime adapter:
+- **Runtime selection**: resolved at `taskflow_run` time (see "Runtime Resolution" below)
+- **Session key**: `taskflow-{pipelineId}-{unitId}`
+- **Agent receives**: unit prompt with working directory
+- **extraSystemPrompt layering** (all optional): plugin config `systemPrompt` + manifest root `systemPrompt` + group `systemPrompt`
+- **Completion detected**: via subagent runtime backend (`waitForRun()`)
+- **Logs**: unit logs include `Runtime:` and `Source:` headers for traceability
 
 ### 2.3 Status Updates
 
@@ -141,7 +153,7 @@ After each unit:
 
 ### 2.4 Notification
 
-Pipeline complete/stopped → system event to `manifest.session`.
+Pipeline complete/stopped currently attempts a callback to the configured taskflow notification session target. Keep in mind this is session-style callback behavior, not a direct unit message.
 
 ## Phase 3: Report (status)
 
@@ -152,9 +164,36 @@ Use `taskflow_status` or `taskflow_list`.
 | Tool | Description |
 |------|-------------|
 | `taskflow_create` | Create pipeline with manifest and unit files |
-| `taskflow_run` | Start pipeline execution |
-| `taskflow_status` | Get pipeline status |
+| `taskflow_get(id)` | Get full manifest |
+| `taskflow_update(id, ...)` | Patch title/systemPrompt/session, reset unit, update unit prompt |
+| `taskflow_delete(id)` | Move task to trash |
+| `taskflow_run(id)` | Start pipeline execution |
+| `taskflow_status(id)` | Get pipeline status summary |
 | `taskflow_list` | List all pipelines |
+
+## System Prompt Layering
+
+Taskflow supports optional `systemPrompt` at three levels:
+
+1. Plugin config `systemPrompt`
+2. Manifest root `systemPrompt`
+3. Group `systemPrompt`
+
+These are combined into `extraSystemPrompt` for the runtime adapter. `unit.prompt` stays as the concrete work order in the message body and should not be duplicated into a unit-level system prompt field.
+
+## Runtime Resolution
+
+Taskflow plugin does **not** decide which runtime to use. It only consumes an already-decided runtime:
+
+1. **`taskflow_run({ id, runtime })`** — per-run override (optional)
+2. **`manifest.runtime.mode`** — explicit pipeline metadata (preferred, set by dev skill / taskflow_create)
+3. **`manifest.agent.runtime`** — legacy field for backward compatibility
+4. **Plugin config `runtime`** — default fallback
+5. **Hardcoded fallback**: `subagent`
+
+The effective selection is recorded in `manifest.run.runtime` with both `mode` and `source` fields. Unit logs include runtime and source for debugging.
+
+**Design principle**: Runtime decision belongs to dev skill / pipeline authoring phase, not the executor. Taskflow plugin is runtime-agnostic.
 
 ## Notes
 
@@ -162,3 +201,4 @@ Use `taskflow_status` or `taskflow_list`.
 2. **No child processes**: everything runs in-process via plugin runtime API
 3. **Manifest is source of truth**: progress, reruns, skips all use manifest
 4. **Fully autonomous**: trigger once, get notified on completion or failure
+5. **Panic stop**: use `taskflow_stop` to halt a running pipeline and best-effort cancel the active unit
