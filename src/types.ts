@@ -131,6 +131,7 @@ export interface Manifest {
   run?: RunState;           // Effective runtime and timestamps for the latest run
   stopRequestedAt?: string | null;
   stopReason?: string | null;
+  session?: string;          // Target session for notifications
   currentUnitId?: string;
   currentUnitPath?: string[];
   failedUnitId?: string;
@@ -166,4 +167,38 @@ export interface UnitResult {
   error?: string;
   sessionKey?: string;
   runtime?: RuntimeMode;
+}
+
+// ── Batch queue ──
+
+export type BatchFailPolicy = "skip-same-project" | "skip-all" | "continue";
+
+export interface BatchRunParams {
+  ids: string[];                    // Pipeline IDs in execution order
+  session: string;                  // Session to notify on completion
+  failPolicy?: BatchFailPolicy;     // Default: "skip-same-project"
+  runtime?: RuntimeMode;            // Optional runtime override for all pipelines
+}
+
+export interface BatchPipelineResult {
+  id: string;
+  title: string;
+  project: string | null;           // Auto-derived from issues[0].path or null
+  status: PipelineStatus | "skipped";
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+}
+
+export interface BatchResult {
+  status: "done" | "partial" | "failed";
+  total: number;
+  done: number;
+  failed: number;
+  skipped: number;
+  results: BatchPipelineResult[];
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
 }

@@ -56,6 +56,23 @@ export function markUnitsStopped(nodes, reason, { includeRunning = true } = {}) 
   }
 }
 
+// ── Project derivation ──
+
+/**
+ * Derive a project identifier from a manifest.
+ * Uses ALL issues[].path sorted and joined as the canonical project key.
+ * This handles multi-repo projects (e.g. backend + frontend repos).
+ * Returns null if no paths are available.
+ */
+export function deriveProject(manifest) {
+  if (!manifest.issues?.length) return null;
+  const paths = manifest.issues
+    .map(i => i.path)
+    .filter(Boolean)
+    .sort();
+  return paths.length > 0 ? paths.join('|') : null;
+}
+
 // ── Tree traversal / rollups ──
 
 export function flattenExecutableUnits(groups) {

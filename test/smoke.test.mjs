@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { resolveRuntimeSelection, buildUnitExecutor, createStopController, buildReporterPrompt } from '../src/runtime.js';
-import { buildEndOfRunReporterPayload, flattenExecutableUnits, findNextPendingExecutableUnit, rollupPipelineStatuses, runPipeline, buildUnitPrompt, buildExtraSystemPrompt } from '../src/platform.js';
+import { deriveProject, buildEndOfRunReporterPayload, flattenExecutableUnits, findNextPendingExecutableUnit, rollupPipelineStatuses, runPipeline, buildUnitPrompt, buildExtraSystemPrompt } from '../src/platform.js';
 
 // ID naming convention (from dev skill):
 //   group id  → a, b, c, d ...
@@ -633,4 +633,32 @@ test('rollupPipelineStatuses keeps group status derived from nested children', (
   assert.equal(manifest.pipeline[0].status, 'failed');
   assert.equal(manifest.pipeline[1].status, 'done');
   assert.equal(manifest.pipeline[1].completedAt, '2026-03-12T11:00:00.000Z');
+});
+
+// ── deriveProject (batch queue) ────────────────────────────────────────────
+
+test('deriveProject returns single path', () => {
+  assert.equal(deriveProject({ issues: [{ path: '/repo/backend', url: 'x', repo: 'x', number: 1 }] }), '/repo/backend');
+});
+
+test('deriveProject joins multiple paths sorted', () => {
+  const manifest = {
+    issues: [
+      { path: '/repo/my-frontend', url: 'x', repo: 'x', number: 1 },
+      { path: '/repo/my-backend', url: 'y', repo: 'y', number: 2 },
+    ]
+  };
+  // Sorted: my-backend < my-frontend
+  assert.equal(deriveProject(manifest), '/repo/my-backend|/repo/my-frontend');
+});
+
+test('deriveProject returns null for manifest without issues', () => {
+  assert.equal(deriveProject({}), null);
+  assert.equal(deriveProject({ issues: [] }), null);
+});
+
+test('deriveProject is order-independent', () => {
+  const a = { issues: [{ path: '/a', url: 'x', repo: 'x', number: 1 }, { path: '/b', url: 'y', repo: 'y', number: 2 }] };
+  const b = { issues: [{ path: '/b', url: 'y', repo: 'y', number: 2 }, { path: '/a', url: 'x', repo: 'x', number: 1 }] };
+  assert.equal(deriveProject(a), deriveProject(b));
 });

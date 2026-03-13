@@ -7,7 +7,7 @@
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import type { Manifest, Group, Unit, Issue, TaskflowPluginConfig, UnitExecutor, UnitResult, RuntimeMode, RuntimeSelection, NotifyFn } from "./src/types.js";
+import type { Manifest, Group, Unit, Issue, TaskflowPluginConfig, UnitExecutor, UnitResult, RuntimeMode, RuntimeSelection, NotifyFn, BatchFailPolicy, BatchPipelineResult, BatchRunParams } from "./src/types.js";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -312,6 +312,175 @@ export default {
           taskDir,
           runtime: runtimeSelection.mode,
           runtimeSource: runtimeSelection.source,
+          dashboard: `http://localhost:${dashboardPort}`,
+        };
+      },
+    }));
+
+    // ── Tool: taskflow_run_batch ──
+    api.registerTool(() => ({
+      name: "taskflow_run_batch",
+      label: "Run Batch Taskflow Pipelines",
+      description: "Run multiple taskflow pipelines sequentially with configurable fail policy. Runs in background, sends batch summary on completion.",
+      parameters: Type.Object({
+        ids: Type.Array(Type.String(), { description: "Pipeline IDs in execution order", minItems: 1 }),
+        session: Type.String({ description: "OpenClaw session id to deliver completion notification" }),
+        failPolicy: Type.Optional(Type.Union([
+          Type.Literal("skip-same-project"),
+          Type.Literal("skip-all"),
+          Type.Literal("continue"),
+        ], { description: 'Fail policy: "skip-same-project" (default) | "skip-all" | "continue"' })),
+        runtime: Type.Optional(Type.Literal("subagent", { description: "Optional runtime override for all pipelines" })),
+      }),
+      async execute(_toolCallId: string, params: BatchRunParams) {
+        const { ids, session } = params;
+        const effectivePolicy: BatchFailPolicy = params.failPolicy || "skip-same-project";
+
+        if (!ids.length) return { error: "ids array must not be empty" };
+
+        // Dynamic imports
+        const { runPipeline, deriveProject } = await import("./src/platform.js");
+
+        // Immediate return value — execution is backgrounded
+        const batchStartedAt = new Date().toISOString();
+        const batchStartedMs = Date.now();
+
+        // Background execution (non-blocking, same pattern as taskflow_run)
+        (async () => {
+          const failedPaths = new Set<string>();
+          const results: BatchPipelineResult[] = [];
+
+          for (const id of ids) {
+            const manifestPath = join(tasksDir, id, "manifest.json");
+            if (!existsSync(manifestPath)) {
+              results.push({ id, title: "?", project: null, status: "failed", error: "manifest not found" });
+              continue;
+            }
+
+            const manifest: Manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+            const project = deriveProject(manifest);
+            const paths: string[] = (manifest.issues || []).map((i: Issue) => i.path).filter(Boolean);
+
+            // Check skip policy (path-level intersection)
+            if (effectivePolicy === "skip-same-project" && paths.length > 0 && paths.some((p: string) => failedPaths.has(p))) {
+              results.push({ id, title: manifest.title, project, status: "skipped" });
+              continue;
+            }
+            if (effectivePolicy === "skip-all" && failedPaths.size > 0) {
+              results.push({ id, title: manifest.title, project, status: "skipped" });
+              continue;
+            }
+
+            // Check if already running
+            if (runningPipelines.has(id)) {
+              results.push({ id, title: manifest.title, project, status: "failed", error: "Already running" });
+              continue;
+            }
+
+            // Run pipeline (sequential — one at a time)
+            const startedAt = new Date().toISOString();
+            const stopController = createStopController();
+            runningPipelines.set(id, { startedAt, stopController });
+
+            const runtimeSelection: RuntimeSelection = resolveRuntimeSelection(config, manifest, params.runtime);
+            manifest.run = { ...(manifest.run || {}), runtime: runtimeSelection };
+            writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+            const executor: UnitExecutor = buildUnitExecutor(api as any, config, manifest, {
+              logger: api.logger,
+              stopController,
+              runtimeMode: runtimeSelection.mode,
+            }) as UnitExecutor;
+
+            try {
+              await runPipeline(tasksDir, id, {
+                executor,
+                pluginSystemPrompt: config.systemPrompt || "",
+                dashboardUrl: `http://localhost:${dashboardPort}`,
+                runtimeSelection,
+                shouldStop: () => Boolean(runningPipelines.get(id)?.stopRequested),
+                onNotify: null, // No per-pipeline reporter in batch mode
+                logger: {
+                  info: (msg: string) => api.logger.info(`taskflow-batch[${id}]: ${msg}`),
+                  warn: (msg: string) => api.logger.warn(`taskflow-batch[${id}]: ${msg}`),
+                  error: (msg: string) => api.logger.error(`taskflow-batch[${id}]: ${msg}`),
+                },
+              });
+
+              // Read final manifest status
+              const finalManifest: Manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+              const completedAt = new Date().toISOString();
+              results.push({
+                id,
+                title: finalManifest.title,
+                project,
+                status: finalManifest.status,
+                startedAt,
+                completedAt,
+                durationMs: Date.parse(completedAt) - Date.parse(startedAt),
+                ...(finalManifest.lastError ? { error: finalManifest.lastError } : {}),
+              });
+
+              if (finalManifest.status === "failed" || finalManifest.status === "stopped") {
+                for (const p of paths) failedPaths.add(p);
+              }
+            } catch (e: any) {
+              results.push({ id, title: manifest.title, project, status: "failed", error: e.message });
+              for (const p of paths) failedPaths.add(p);
+            } finally {
+              runningPipelines.delete(id);
+            }
+          }
+
+          // Build and deliver batch summary
+          const batchCompletedAt = new Date().toISOString();
+          const doneCount = results.filter(r => r.status === "done").length;
+          const failedCount = results.filter(r => r.status === "failed" || r.status === "stopped").length;
+          const skippedCount = results.filter(r => r.status === "skipped").length;
+
+          const lines = [
+            `🌅 Batch complete (${doneCount}/${results.length} done, ${failedCount} failed, ${skippedCount} skipped)`,
+            "",
+            ...results.map(r => {
+              const icon = r.status === "done" ? "✅" : r.status === "skipped" ? "⏭️" : "❌";
+              const duration = r.durationMs ? ` (${Math.round(r.durationMs / 1000)}s)` : "";
+              return `${icon} ${r.title} — ${r.status}${duration}${r.error ? `: ${r.error.slice(0, 80)}` : ""}`;
+            }),
+          ];
+          const summaryText = `[FORWARD_TO_USER]\n${lines.join("\n")}`;
+
+          // Deliver via reporter subagent
+          try {
+            const runtime = (api as any).runtime?.subagent;
+            if (runtime) {
+              await runtime.run({
+                sessionKey: `taskflow-batch-${Date.now()}-reporter`,
+                message: `Deliver this exact message via sessions_send to ${session}:\n\n${summaryText}`,
+                idempotencyKey: `taskflow-batch-reporter-${batchStartedAt}`,
+              });
+            }
+          } catch (e: any) {
+            api.logger.error(`taskflow batch reporter failed: ${e.message}`);
+          }
+        })().catch((e: Error) => {
+          api.logger.error(`taskflow-batch: Fatal: ${e.message}`);
+        });
+
+        // Resolve first pipeline's runtime for the return value
+        let firstRuntime: RuntimeMode = "subagent";
+        try {
+          const firstManifestPath = join(tasksDir, ids[0], "manifest.json");
+          if (existsSync(firstManifestPath)) {
+            const firstManifest: Manifest = JSON.parse(readFileSync(firstManifestPath, "utf-8"));
+            firstRuntime = resolveRuntimeSelection(config, firstManifest, params.runtime).mode;
+          }
+        } catch { /* use default */ }
+
+        return {
+          status: "started",
+          count: ids.length,
+          failPolicy: effectivePolicy,
+          runtime: firstRuntime,
           dashboard: `http://localhost:${dashboardPort}`,
         };
       },
